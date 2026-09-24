@@ -1,0 +1,36 @@
+Let LIVECD_MKFS_EXT_OPTS add options to mkfs for ext filesystems and skip
+the automatic 'tune2fs -O dir_index' when it disables dir_index.
+
+32-bit programs that read directories without large-file support (glibc's
+non-LFS readdir, used e.g. by libsemanage) fail with EOVERFLOW on ext4
+hashed directories when run under qemu-user, because the 64-bit qemu process
+receives 64-bit directory offsets. Building the root filesystem without
+dir_index avoids that; the index is re-created after the build.
+
+Generated against livecd-tools 31.0 (python3-imgcreate-31.0-15.el9).
+
+--- a/imgcreate/fs.py
++++ b/imgcreate/fs.py
+@@ -1089,6 +1089,9 @@ class ExtDiskMount(DiskMount):
+         if self.fstype.startswith('ext'):
+             args += ['-F', '-L', self.fslabel[0:16], '-m', '1', '-b',
+                      str(self.blocksize)]
++            # Extra mkfs options, e.g. '-O ^dir_index' for cross-architecture
++            # builds where 32-bit scriptlets run under qemu-user.
++            args += os.environ.get('LIVECD_MKFS_EXT_OPTS', '').split()
+         elif self.fstype == 'xfs':
+             args += ['-L', self.fslabel[0:12], '-b', 'size=%s' %
+                      str(self.blocksize)]
+@@ -1108,8 +1111,10 @@ class ExtDiskMount(DiskMount):
+             raise MountError("Error creating %s filesystem" % (self.fstype,))
+         if self.fstype.startswith('ext'):
+             logging.info('Tuning filesystem on %s' % self.disk.device)
+-            call(['tune2fs', '-c0', '-i0', '-Odir_index',
+-                  '-ouser_xattr,acl', self.disk.device])
++            tune_args = ['tune2fs', '-c0', '-i0']
++            if '^dir_index' not in os.environ.get('LIVECD_MKFS_EXT_OPTS', ''):
++                tune_args += ['-Odir_index']
++            call(tune_args + ['-ouser_xattr,acl', self.disk.device])
+ 
+     def __resize_filesystem(self, size=None, ops=''):
+         current_size = os.stat(self.disk.lofile)[stat.ST_SIZE]

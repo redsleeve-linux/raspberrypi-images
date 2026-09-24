@@ -1,0 +1,277 @@
+name: Build RedSleeve Raspberry Pi image
+
+run-name: >-
+  ${{ github.ref_type == 'tag'
+      && format('Release {0}: RedSleeve 9 Raspberry Pi console MBR image', github.ref_name)
+      || 'Build RedSleeve 9 Raspberry Pi console MBR image' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      store_as_artifact:
+        description: "Store image to the workflow Artifacts"
+        required: true
+        type: boolean
+        default: true
+
+  # A version tag builds and publishes a release. Tags are
+  # '<point release>-<build date>': 9.8-20260923, later 10.0-20270415.
+  # The release is only created after a successful build, never empty.
+  push:
+    tags:
+      - '[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    name: RedSleeve 9 'console' mbr image (armv6hl)
+    runs-on: ubuntu-24.04
+    # rpm scriptlets and %post run under qemu-arm emulation: slow
+    timeout-minutes: 240
+    permissions:
+      # 'gh release create' and 'gh release upload' write to the repository
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install utilities
+      run: |
+        sudo apt-get -y update
+        sudo apt-get -y install xz-utils rpm
+
+    # A runner only guarantees 14 GB; the build needs room for the install root,
+    # the 3.5 GB raw image and appliance-creator's copy of it. Nothing here uses
+    # the preinstalled toolchains.
+    - name: Free up disk space
+      run: |
+        df -h /
+        sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+                    /opt/ghc /usr/local/.ghcup /usr/local/share/powershell
+        df -h /
+
+        # Expect this to be empty and the copy in 'Create image' to list
+        # /swapfile: the runner enables swap part-way through the job, which is
+        # what made NOTES.md finding 10 look intermittent.
+        echo "--- runner swap at job start ---"
+        cat /proc/swaps
+
+    # Registers the qemu-arm binfmt handler on the runner kernel with the 'F'
+    # flag, which lets the build container execute armv6hl binaries chroot'ed
+    # into the install root.
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: arm
+
+    - name: Check the qemu-arm binfmt handler
+      run: |
+        cat /proc/sys/fs/binfmt_misc/qemu-arm
+        grep -qE '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-arm
+
+    - name: Build the build container
+      run: |
+        docker build -t rs-appliance-creator -f ci/Dockerfile .
+
+    - name: Set environment variables
+      run: |
+        # RedSleeve release (e.g. 9.8) from the redsleeve-release package in BaseOS
+        release=$(docker run --rm --entrypoint dnf rs-appliance-creator -q repoquery \
+                    --forcearch=armv6hl \
+                    --repofrompath=rsb,https://www.mirrorservice.org/sites/ftp.redsleeve.org/pub/el9/9/BaseOS \
+                    --disablerepo='*' --enablerepo=rsb --qf '%{version}' redsleeve-release 2>/dev/null \
+                  | sort -V | tail -1)
+        release=${release:-9}
+        echo "release_str=${release}" >> "$GITHUB_ENV"
+
+        # The mirrorlists track the current point release, so a tag cut around a
+        # point-release bump can name the wrong one. Catch it before the build.
+        if [ "${GITHUB_REF_TYPE}" = tag ]
+        then
+          tag_release=${GITHUB_REF_NAME%%-*}
+          if [ "${tag_release}" != "${release}" ]
+          then
+            echo "::error::tag ${GITHUB_REF_NAME} claims RedSleeve ${tag_release}, but the repositories are at ${release}. Re-tag as ${release}-$(date -u '+%Y%m%d')."
+            exit 1
+          fi
+        fi
+
+        # date stamp
+        date_stamp=$(date -u '+%Y%m%d')
+        echo "date_stamp=${date_stamp}" >> "$GITHUB_ENV"
+
+        # date_time stamp
+        date_time_stamp=$(date -u '+%Y%m%d%H%M%S')
+        echo "date_time_stamp=${date_time_stamp}" >> "$GITHUB_ENV"
+
+        # Kickstart file name
+        echo "kickstart=RedSleeve-9-RaspberryPi-console-mbr.armv6hl.ks" >> "$GITHUB_ENV"
+
+        # Appliance Tools results directory
+        rpi_image_resultdir="${GITHUB_WORKSPACE}/rpi-image"
+        echo "rpi_image_resultdir=${rpi_image_resultdir}" >> "$GITHUB_ENV"
+        mkdir -p "${rpi_image_resultdir}" cache
+
+        # Image file base name. A tag build names the image after the tag, so
+        # the release asset and the tag can never disagree.
+        if [ "${GITHUB_REF_TYPE}" = tag ]
+        then
+          image_name="RedSleeve-RaspberryPi-mbr-${GITHUB_REF_NAME}.armv6hl"
+        else
+          image_name="RedSleeve-RaspberryPi-mbr-${release}-${date_stamp}.armv6hl"
+        fi
+        echo "image_name=${image_name}" >> "$GITHUB_ENV"
+
+        df -h /
+
+    - name: Create image
+      id: create-image
+      run: |
+        # The moment mkswap's check would read it; /proc/swaps is shared with
+        # the container. A '/swapfile' line here is the condition that used to
+        # break the image's swapfile (NOTES.md finding 10).
+        echo "--- /proc/swaps immediately before the build ---"
+        cat /proc/swaps
+
+        docker run --privileged --rm \
+          -v "${GITHUB_WORKSPACE}/kickstart:/work/kickstart:ro" \
+          -v "${GITHUB_WORKSPACE}/cache:/work/cache" \
+          -v "${{ env.rpi_image_resultdir }}:/rpi-image" \
+          rs-appliance-creator "kickstart/${{ env.kickstart }}" "${{ env.image_name }}"
+
+        # results are created by root inside the container
+        sudo chown -R "$(id -u):$(id -g)" "${{ env.rpi_image_resultdir }}"
+        ls -l "${{ env.rpi_image_resultdir }}"
+
+        # A full disk does not fail the build; writes into the sparse image are
+        # just lost.
+        df -h /
+
+    # Loop-mount checklist: mostly a report, but fails the job on a missing swap
+    # signature or an unmountable image. Must run before the raw image is xz'd.
+    - name: Verify the image
+      if: steps.create-image.outcome == 'success'
+      run: |
+        sudo bash tools/verify-image.sh "${{ env.rpi_image_resultdir }}/${{ env.image_name }}.raw"
+
+    - name: Compress image
+      if: steps.create-image.outcome == 'success'
+      id: compress-image
+      run: |
+        cd ${{ env.rpi_image_resultdir }}
+
+        # XZ default compression level is 6 (of 0-9). No -k: dropping the 3.5 GB
+        # raw image keeps the runner from filling up.
+        xz -9 -e -T0 ${{ env.image_name }}.raw
+        sha256sum ${{ env.image_name }}.raw.xz | tee ${{ env.image_name }}.raw.xz.sha256
+        ls -l ${{ env.image_name }}.raw*
+        df -h /
+
+    - name: Collect and compress logs, xml
+      id: compress-logs
+      if: success() || failure()
+      run: |
+        cd ${{ env.rpi_image_resultdir }}
+        sudo chown -R "$(id -u):$(id -g)" . || true
+        tar cf ${{ env.image_name }}.log.tar ${{ env.image_name }}.log*
+
+        if [ -f ${{ env.image_name }}.xml ]; then
+          tar --append --file=${{ env.image_name }}.log.tar ${{ env.image_name }}.xml
+        fi
+
+        # XZ default compression level is 6 (of 0-9)
+        xz -9 -e -T0 ${{ env.image_name }}.log.tar || true
+
+    - uses: actions/upload-artifact@v7
+      name: Store logs, xml as artifact
+      id: logs-artifact
+      if: success() || failure()
+      with:
+        # Artifact names must be unique within a run, and with archive:false the
+        # name is also the downloaded file name.
+        name: ${{ env.image_name }}.log.tar.xz
+        archive: false
+        path: ${{ env.rpi_image_resultdir }}/${{ env.image_name }}.log.tar.xz
+
+    - uses: actions/upload-artifact@v7
+      name: Store image as artifact
+      id: image-artifact
+      if: >-
+        steps.compress-image.outcome == 'success'
+        && (github.event_name != 'workflow_dispatch' || inputs.store_as_artifact)
+      with:
+        name: ${{ env.image_name }}.raw.xz
+        archive: false
+        path: ${{ env.rpi_image_resultdir }}/${{ env.image_name }}.raw.xz
+
+    # Tag builds only. Release assets are capped at 2 GiB each (image ~185 MB)
+    # and, unlike artifacts, never expire.
+    - name: Publish the GitHub release
+      id: publish-release
+      if: steps.compress-image.outcome == 'success' && github.ref_type == 'tag'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        cd ${{ env.rpi_image_resultdir }}
+        tag="${GITHUB_REF_NAME}"
+
+        # Create the release on the first successful build of the tag; a re-run
+        # only refreshes the assets, so hand-edited release notes survive.
+        if ! gh release view "$tag" >/dev/null 2>&1
+        then
+          {
+            echo "RedSleeve ${{ env.release_str }} console image for the Raspberry Pi"
+            echo "1 / Zero / Zero W / Zero 2 W / 2 / 3 (armv6hl)."
+            echo
+            echo "Write it to an SD card with Raspberry Pi Imager or cli \`xzcat <image>.raw.xz | sudo dd of=/dev/sdX bs=4M status=progress\`."
+            echo "Default login \`redsleeve\` / \`redsleeve\` - remember to change it on first boot."
+            echo
+            echo '```'
+            cat ${{ env.image_name }}.raw.xz.sha256
+            echo '```'
+          } > release-notes.md
+
+          gh release create "$tag" \
+            --verify-tag \
+            --title "RedSleeve ${tag} Raspberry Pi image" \
+            --notes-file release-notes.md
+        fi
+
+        gh release upload "$tag" --clobber \
+          ${{ env.image_name }}.raw.xz \
+          ${{ env.image_name }}.raw.xz.sha256
+
+        # The build log is a nice-to-have; never fail a finished release over it.
+        gh release upload "$tag" --clobber ${{ env.image_name }}.log.tar.xz || true
+
+        echo "release_url=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+
+    - name: Job summary
+      if: success() || failure()
+      run: |
+        {
+          echo "### RedSleeve ${{ env.release_str }} Raspberry Pi console image"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Image | \`${{ env.image_name }}.raw.xz\` |"
+          if [ -n "${{ steps.image-artifact.outputs.artifact-url }}" ]; then
+            echo "| Artifact | ${{ steps.image-artifact.outputs.artifact-url }} |"
+          fi
+          if [ -n "${{ steps.logs-artifact.outputs.artifact-url }}" ]; then
+            echo "| Logs | ${{ steps.logs-artifact.outputs.artifact-url }} |"
+          fi
+          if [ -n "${{ steps.publish-release.outputs.release_url }}" ]; then
+            echo "| Release | ${{ steps.publish-release.outputs.release_url }} |"
+          fi
+          sha_file="${{ env.rpi_image_resultdir }}/${{ env.image_name }}.raw.xz.sha256"
+          if [ -f "$sha_file" ]; then
+            echo
+            echo '```'
+            cat "$sha_file"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

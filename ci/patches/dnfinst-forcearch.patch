@@ -1,0 +1,37 @@
+Let livecd-tools/appliance-creator build for a foreign architecture.
+
+With LIVECD_FORCEARCH=armv6hl in the environment, dnf resolves and installs
+armv6hl packages into the install root from an x86_64/aarch64 host, exactly
+like 'mock --forcearch'. The rpm scriptlets and the kickstart %post are then
+executed inside the install root through binfmt_misc (qemu-user-static
+registered with the 'F' flag). dnf and rpm themselves keep running natively.
+
+Generated against livecd-tools 31.0 (python3-imgcreate-31.0-15.el9).
+
+--- a/imgcreate/dnfinst.py
++++ b/imgcreate/dnfinst.py
+@@ -100,6 +100,15 @@ class DnfLiveCD(dnf.Base):
+         self.conf.prepend_installroot("cachedir")
+         self.conf.prepend_installroot("persistdir")
+         self.conf.install_weak_deps = not excludeWeakdeps
++        # Cross-architecture builds (like 'mock --forcearch'): resolve and
++        # install packages for the architecture in LIVECD_FORCEARCH. The rpm
++        # scriptlets and the kickstart %post then run in the install root
++        # through binfmt_misc (qemu-user-static registered with the 'F' flag).
++        forcearch = os.environ.get("LIVECD_FORCEARCH")
++        if forcearch:
++            logging.info("Forcing target architecture %s", forcearch)
++            self.conf.arch = forcearch
++            self.conf.ignorearch = True
+         if cacheonly:
+             dnf.repo.Repo.DEFAULT_SYNC = dnf.repo.SYNC_ONLY_CACHE
+         else:
+@@ -155,7 +164,7 @@ class DnfLiveCD(dnf.Base):
+     def addRepository(self, name, url = None, mirrorlist = None):
+         def _varSubstitute(option):
+             # takes a variable and substitutes like dnf configs do
+-            arch = hawkey.detect_arch()
++            arch = self.conf.substitutions.get('arch') or hawkey.detect_arch()
+             option = option.replace("$basearch", dnf.rpm.basearch(arch))
+             option = option.replace("$arch", arch)
+             # If the url includes $releasever substitute user's value or

@@ -1,0 +1,32 @@
+Lazy-unmount /sys when a normal unmount fails at the end of the build.
+Same patch the AlmaLinux raspberry-pi GitHub-hosted workflow applies inline.
+https://github.com/livecd-tools/livecd-tools/issues/258
+
+--- a/imgcreate/fs.py
++++ b/imgcreate/fs.py
+@@ -1036,6 +1036,8 @@
+                 open(self.dest, 'a').close()
+             else:
+                 return
++
++        logging.info("BindChrootMount mounting %s into %s" % (self.src, self.dest))
+         args = ['mount', '--bind', self.src, self.dest]
+         rc = call(args)
+         if rc != 0:
+@@ -1065,10 +1067,15 @@
+             self.mounted = False
+             return
+
++        logging.info("BindChrootMount Unmounting directory %s" % self.dest)
+         rc = call(['umount', self.dest])
+         if rc != 0:
+             call(['umount', '-l', self.dest])
+-            raise MountError(umount_fail_fmt % self.dest)
++            if self.src == '/sys':
++                logging.info("Unable to unmount %s normally, source %s exception using lazy unmount" %
++                             (self.dest, self.src))
++            else:
++                raise MountError(umount_fail_fmt % self.dest)
+         self.mounted = False
+
+     def cleanup(self):
