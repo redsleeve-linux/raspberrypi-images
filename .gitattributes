@@ -1,0 +1,10 @@
+# Everything that ends up inside the Linux build container must keep LF line
+# endings, also on Windows checkouts.
+* text=auto
+build          text eol=lf
+*.sh           text eol=lf
+*.ks           text eol=lf
+*.patch        text eol=lf
+Dockerfile     text eol=lf
+*.yml          text eol=lf
+*.md           text eol=lf

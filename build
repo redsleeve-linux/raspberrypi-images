@@ -1,0 +1,92 @@
+#!/bin/bash
+# vim: ts=4 sw=4 expandtab
+#
+# Build a RedSleeve 9 (armv6hl) Raspberry Pi image with Docker (or Podman).
+#
+# Works on any Docker host whose kernel supports binfmt_misc, loop devices and
+# device-mapper: Linux, a Fedora/Ubuntu WSL2 instance, or Docker Desktop with
+# the WSL2 backend (best effort; keep this checkout inside the WSL filesystem
+# for speed).
+#
+# Usage: ./build [variant]
+#   default variant: RedSleeve-9-RaspberryPi-console-mbr
+#
+# Output: rpi-image/<variant>-<date>.armv6hl.raw(.xz) next to this script.
+#
+# Environment: DOCKER=podman to use Podman (run it as root), IMAGE_TAG to change
+# the build container tag.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DATE=$(date +%Y%m%d-%H%M%S)
+DOCKER=${DOCKER:-docker}
+IMAGE_TAG=${IMAGE_TAG:-rs-appliance-creator}
+
+readarray -t VARIANTS < <(ls -1 "${SCRIPT_DIR}/kickstart" | sed -e 's|\.armv6hl\.ks$||')
+
+show_usage()
+{
+    echo "Usage: $0 [variant]"
+    echo
+    echo "Available variants are:"
+    for variant in "${VARIANTS[@]}"
+    do
+        echo "    $variant"
+    done
+    echo
+}
+
+if [ $# -gt 1 ]
+then
+    show_usage
+    exit 1
+fi
+
+VARIANT=${1:-RedSleeve-9-RaspberryPi-console-mbr}
+KS="kickstart/${VARIANT}.armv6hl.ks"
+
+if [ ! -f "${SCRIPT_DIR}/${KS}" ]
+then
+    echo "Error: Invalid variant!"
+    echo
+    show_usage
+    exit 1
+fi
+
+NAME="${VARIANT}-${DATE}.armv6hl"
+mkdir -p "${SCRIPT_DIR}/cache" "${SCRIPT_DIR}/rpi-image"
+
+# Host-side paths for the bind mounts. Under Git Bash / MSYS on Windows use
+# Windows paths and stop MSYS from rewriting the container-side paths.
+HOST_DIR=${SCRIPT_DIR}
+if [ -n "${MSYSTEM:-}" ]
+then
+    HOST_DIR=$(cygpath -w "${SCRIPT_DIR}")
+    export MSYS_NO_PATHCONV=1
+fi
+
+echo "==> Registering the qemu-arm binfmt handler on the host kernel"
+"${DOCKER}" run --privileged --rm docker.io/tonistiigi/binfmt --install arm
+
+echo "==> Building the build container image (${IMAGE_TAG})"
+"${DOCKER}" build -t "${IMAGE_TAG}" -f "${SCRIPT_DIR}/ci/Dockerfile" "${SCRIPT_DIR}"
+
+echo "==> Running appliance-creator for ${VARIANT}"
+"${DOCKER}" run --privileged --rm \
+    -v "${HOST_DIR}/kickstart:/work/kickstart:ro" \
+    -v "${HOST_DIR}/cache:/work/cache" \
+    -v "${HOST_DIR}/rpi-image:/rpi-image" \
+    "${IMAGE_TAG}" "${KS}" "${NAME}"
+
+echo "==> Compressing ${NAME}.raw"
+if command -v xz >/dev/null 2>&1
+then
+    xz -k -9 -e -T0 "${SCRIPT_DIR}/rpi-image/${NAME}.raw"
+else
+    "${DOCKER}" run --rm --entrypoint xz -v "${HOST_DIR}/rpi-image:/rpi-image" "${IMAGE_TAG}" \
+        -k -9 -e -T0 "/rpi-image/${NAME}.raw"
+fi
+
+echo "==> Done:"
+ls -l "${SCRIPT_DIR}/rpi-image/${NAME}".*
